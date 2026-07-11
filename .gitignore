@@ -1,0 +1,118 @@
+# =============================================================================
+# GitIgnore for c411_exporter (Go Prometheus Exporter)
+# =============================================================================
+
+# =============================================================================
+# Binary Files & Build Artifacts
+# =============================================================================
+c411_exporter              # Compiled binary
+*.exe                       # Windows executables
+*.exe~                      # Windows executable backup
+*.dll                       # Windows DLLs
+*.so                        # Shared objects (Linux)
+*.dylib                     # Dynamic libraries (macOS)
+
+# Go workspace artifacts
+tmp/                       # Temporary files
+temp/
+*.tmp
+*.temp
+
+# Vendor and cache directories
+vendor/
+Godeps/
+pkg/
+dist/
+build/
+bin/
+go-build/
+
+# Docker build outputs (inside container context)
+.docker-cache/
+.go-mod-cache/
+
+# =============================================================================
+# Environment Files & Secrets ⚠️ CRITICAL - DO NOT COMMIT
+# =============================================================================
+.env                        # Your credentials - NEVER commit this!
+.env.local                   # Local environment with secrets
+.env.*.local                 # Any local env file
+*.env.local
+*.pem                       # SSL certificates
+*.key                       # Private keys
+*.p12
+*.crt
+*.crl
+
+# Git credential cache (may contain stored passwords)
+.credentialcache/
+
+# =============================================================================
+# OS-Specific Files
+# =============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*                         # macOS file icon metadata
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+desktop.ini
+
+# Linux/Binaries (systemd, etc.)
+systemd-private-*/
+snap-private-*/
+
+# =============================================================================
+# IDE & Editor Files
+# =============================================================================
+# VS Code
+.vscode/settings.json       # User settings (ignore project-specific if needed)
+.vscode/tasks.json
+.vscode/launch.json
+.vscode/extensions.json
+
+# GoLand / IntelliJ
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/usbCache/
+.idea/dictionaries
+.idea/libraries/
+.idea/**/workspace.xml
+*.iml
+*.iws
+
+# General editor backup files
+*~                          # Emacs backup
+.swp                        # Vim swap files
+.swo
+*.bak
+.cache/
+.cloudeaterm-cache/
+
+# =============================================================================
+# Logs & Test Coverage
+# =============================================================================
+*.log                       # Log files
+logs/
+var/log/*.log               # Application logs
+
+# Test coverage reports
+coverage.out
+coverage.txt
+coverage.html
+coverage.json
+profile.out
+profile.cache
+
+# =============================================================================
+# Miscellaneous Go Files
+# =============================================================================
+*.gcda                      # Code coverage data
+*.gcno                      # Coverage generation files
+*.out                       # Compiled program output
+*.test                      # Generated test helpers (if custom)

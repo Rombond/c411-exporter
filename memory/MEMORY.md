@@ -1,0 +1,2 @@
+- user_constraints — Only modify main.go, use docker-compose.dev.yml
+- auth_fix_feedback — Fix 401 with browser headers + CSRF token from /login visit

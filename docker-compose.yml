@@ -1,0 +1,14 @@
+services:
+  c411-exporter:
+    container_name: c411-exporter
+    image: ghcr.io/rombond/c411-exporter:latest
+    ports:
+      - "${EXPORTER_PORT:-9090}:${EXPORTER_PORT:-9090}"
+    environment:
+      - C411_USERNAME=${C411_USERNAME:-}
+      - C411_PASSWORD=${C411_PASSWORD:-}
+      - METRICS_PATH=${METRICS_PATH:-/metrics}
+      - PORT=${PORT:-9090}
+      - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-5m}
+      - C411_API_BASE_URL=${C411_API_BASE_URL:-c411.org}
+    restart: unless-stopped
