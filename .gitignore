@@ -116,3 +116,4 @@ profile.cache
 *.gcno                      # Coverage generation files
 *.out                       # Compiled program output
 *.test                      # Generated test helpers (if custom)
+.env
