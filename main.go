@@ -28,6 +28,7 @@ type config struct {
 	ScrapeInterval time.Duration
 	Username       string
 	Password       string
+	Passkey        string
 	LoginURL       string
 	UsersURL       string
 }
@@ -40,10 +41,11 @@ func loadConfig() config {
 		MetricsPath:    getEnvOrDefault("METRICS_PATH", "/metrics"),
 		Username:       os.Getenv("C411_USERNAME"),
 		Password:       os.Getenv("C411_PASSWORD"),
+		Passkey:        os.Getenv("C411_PASSKEY"),
 		ScrapeInterval: parseDuration(os.Getenv("SCRAPE_INTERVAL"), 5*time.Minute),
 		// Use web login URL for proper auth flow - visits /login first to get session cookies
-		LoginURL:       base + "/login",
-		UsersURL:       base + "/api/auth/me",
+		LoginURL: base + "/login",
+		UsersURL: base + "/api/auth/me",
 	}
 }
 
@@ -68,6 +70,7 @@ type C411Client struct {
 	apiLoginURL string
 	usersURL    string
 	httpClient  *http.Client
+	passkey     *passkey
 }
 
 // c411Jar implements http.CookieJar with per-URL cookie storage
@@ -140,7 +143,7 @@ func (c *C411Client) FirstRequest() error {
 	}
 
 	html := string(body)
-	fmt.Printf("[auth] Response status: %s, cookies: %+v\n", resp.Status, resp.Cookies())
+	fmt.Printf("[auth] Response status: %s\n", resp.Status)
 
 	// Extract CSRF token from <meta name="csrf-token" content="...">
 	re := regexp.MustCompile(`(?i)<meta[^>]*name=["']csrf-token["'][^>]*content=["']([^"']+)["']`)
@@ -151,7 +154,7 @@ func (c *C411Client) FirstRequest() error {
 		c.csrfToken = matches[1]
 		c.mu.Unlock()
 
-		fmt.Printf("[auth] CSRF token extracted, cookies stored: %+v\n", c.cookies)
+		fmt.Println("[auth] CSRF token extracted")
 		return nil
 	}
 
@@ -166,6 +169,10 @@ func (c *C411Client) IsAuthenticated() bool {
 
 // Login authenticates with the C411 API and stores the returned session cookies.
 func (c *C411Client) Login(username, password string) error {
+	// Password login now requires a Cloudflare Turnstile token; prefer the passkey.
+	if c.passkey != nil {
+		return c.PasskeyLogin()
+	}
 	if err := c.FirstRequest(); err != nil {
 		return fmt.Errorf("first request failed: %w", err)
 	}
@@ -218,7 +225,7 @@ func (c *C411Client) Login(username, password string) error {
 	c.cookies = append(c.cookies, resp.Cookies()...)
 	c.mu.Unlock()
 
-	fmt.Printf("[auth] Authenticated as %s, cookies: %+v\n", username, c.cookies)
+	fmt.Printf("[auth] Authenticated as %s\n", username)
 	return nil
 }
 
@@ -372,7 +379,7 @@ func (s *server) scrapeAndRefresh() {
 
 // reconnect re-authenticates using the stored credentials.
 func (s *server) reconnect() error {
-	if s.username == "" || s.password == "" {
+	if s.client.passkey == nil && (s.username == "" || s.password == "") {
 		return fmt.Errorf("cannot reconnect: no credentials configured")
 	}
 	fmt.Println("[scraper] Reconnecting...")
@@ -422,8 +429,18 @@ func main() {
 	metrics := newExporterMetrics(prometheus.DefaultRegisterer)
 	srv := &server{client: client, metrics: metrics, username: cfg.Username, password: cfg.Password}
 
-	// Attempt auto-login on startup if credentials are provided.
-	if cfg.Username != "" && cfg.Password != "" {
+	if cfg.Passkey != "" {
+		pk, err := parsePasskey(cfg.Passkey)
+		if err != nil {
+			fmt.Printf("[auth] Invalid C411_PASSKEY: %v\n", err)
+			os.Exit(1)
+		}
+		client.passkey = pk
+		fmt.Println("[auth] Passkey loaded, attempting passkey login...")
+		if err := client.Login("", ""); err != nil {
+			fmt.Printf("[auth] Auto-login failed (non-fatal): %v\n", err)
+		}
+	} else if cfg.Username != "" && cfg.Password != "" {
 		fmt.Println("[auth] Credentials found, attempting auto-login...")
 		if err := client.Login(cfg.Username, cfg.Password); err != nil {
 			fmt.Printf("[auth] Auto-login failed (non-fatal): %v\n", err)
@@ -438,7 +455,7 @@ func main() {
 	r.GET(cfg.MetricsPath, srv.metricsHandler)
 	r.GET("/health", srv.healthHandler)
 
-			// Start background metrics refresher
+	// Start background metrics refresher
 	srv.startMetricsRefresher(cfg.ScrapeInterval)
 	fmt.Printf("[server] Metrics refresh interval: %v\n", cfg.ScrapeInterval)
 

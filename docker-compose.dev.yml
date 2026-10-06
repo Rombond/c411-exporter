@@ -9,6 +9,7 @@ services:
     environment:
       - C411_USERNAME=${C411_USERNAME:-}
       - C411_PASSWORD=${C411_PASSWORD:-}
+      - C411_PASSKEY=${C411_PASSKEY:-}
       - METRICS_PATH=${METRICS_PATH:-/metrics}
       - PORT=${PORT:-9090}
       - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-5m}

@@ -35,7 +35,8 @@ This is a **Go-based Prometheus exporter** that scrapes user metrics from the C4
 ```
 C411_API_BASE_URL     # C411 API host (e.g., c411.org)
 C411_USERNAME         # API credentials (required for auth)
-C411_PASSWORD         # API credentials (required for auth)
+C411_PASSWORD         # Password login (blocked by Cloudflare Turnstile since 2026-10, kept as fallback)
+C411_PASSKEY          # JSON passkey from Bitwarden/Vaultwarden (preferred, see Authentication below)
 PORT                  # Server port (default: 9090)
 METRICS_PATH          # Metrics path (default: /metrics)
 SCRAPE_INTERVAL       # How often to refresh metrics (configured in cron, not used here)
@@ -91,3 +92,19 @@ docker compose -f docker-compose.dev.yml logs -f
 docker compose -f docker-compose.dev.yml down
 ```
 
+
+## Authentication (updated 2026-10-06)
+
+`POST /api/auth/login` now returns `400 TURNSTILE_REQUIRED` (Cloudflare Turnstile), which plain HTTP,
+FlareSolverr and stock Playwright cannot satisfy. The exporter logs in with a **passkey** instead
+(`passkey.go`), which does not require Turnstile:
+
+1. `GET /login` for the `__csrf` cookie and `csrf-token` meta
+2. `POST /api/auth/passkey-login-options` returns `{options.challenge, challengeToken}`
+3. Sign the challenge locally (ES256, software authenticator) and `POST /api/auth/passkey-login`
+   with `{challengeToken, response}`
+4. Session cookies from the response are reused for `/api/auth/me`; on failure the exporter repeats the passkey login
+
+`C411_PASSKEY` is the JSON of `login.fido2Credentials[0]` from a Bitwarden/Vaultwarden item:
+`{"credentialId":"<guid>","keyValue":"<base64 pkcs8>","rpId":"c411.org","userHandle":"<b64url>","counter":"0"}`.
+Prefer a dedicated passkey for the exporter: it is a full login secret, treat it like a password.
