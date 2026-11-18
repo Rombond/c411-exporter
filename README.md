@@ -30,9 +30,45 @@ Use a dedicated passkey for the exporter: it is a full login secret.
 ## Run
 
 ```bash
+# Prebuilt image (ghcr.io/rombond/c411-exporter:latest)
+docker compose up -d
+
+# Dev build
 docker compose -f docker-compose.dev.yml up --build
-curl localhost:9090/metrics
+
+# Local
+go build -o c411_exporter . && ./c411_exporter
 ```
+
+## Endpoints
+
+- `GET /metrics` - Prometheus metrics
+- `GET /health` - Health check
+
+```text
+# TYPE c411_total_uploaded_bytes gauge
+c411_total_uploaded_bytes 5.58255848392e+11
+# TYPE c411_total_downloaded_bytes gauge
+c411_total_downloaded_bytes 1.073741824e+09
+```
+
+## Prometheus Configuration
+
+```yaml
+scrape_configs:
+  - job_name: 'c411_exporter'
+    static_configs:
+      - targets: ['localhost:9090']
+    metrics_path: /metrics
+```
+
+## Authentication Flow
+
+1. With `C411_PASSKEY`: `GET /login` (CSRF), `POST /api/auth/passkey-login-options` for the challenge, sign it locally (ES256), `POST /api/auth/passkey-login`
+2. Without it: `POST /api/auth/login` with username/password (fails with `400 TURNSTILE_REQUIRED` while Turnstile is on)
+3. Keep the session cookies; on expiry the exporter logs in again with the same method
+
+See [CHANGELOG.md](./CHANGELOG.md) for the passkey migration.
 
 ## License
 
