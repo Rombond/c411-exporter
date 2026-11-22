@@ -5,9 +5,7 @@ services:
     ports:
       - "${EXPORTER_PORT:-9090}:${EXPORTER_PORT:-9090}"
     environment:
-      - C411_USERNAME=${C411_USERNAME:-}
-      - C411_PASSWORD=${C411_PASSWORD:-}
-      - C411_PASSKEY=${C411_PASSKEY:-}
+      - C411_API_KEY=${C411_API_KEY:?C411_API_KEY is required}
       - METRICS_PATH=${METRICS_PATH:-/metrics}
       - PORT=${PORT:-9090}
       - SCRAPE_INTERVAL=${SCRAPE_INTERVAL:-5m}

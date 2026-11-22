@@ -27,11 +27,6 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=builder /app/c411_exporter .
 
-# Create output directory
-RUN mkdir -p c411_exports && chmod 777 c411_exports
+EXPOSE 9090
 
-# Expose port
-EXPOSE 8080
-
-# Run the application
-CMD ["./c411_exporter", "-config=config.json"]
+CMD ["./c411_exporter"]

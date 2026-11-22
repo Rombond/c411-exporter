@@ -2,20 +2,21 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+const minScrapeInterval = 30 * time.Second // the API refreshes data at most every 30 s
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -23,29 +24,32 @@ import (
 
 type config struct {
 	BaseURL        string
+	APIKey         string
 	Port           string
 	MetricsPath    string
 	ScrapeInterval time.Duration
-	Username       string
-	Password       string
-	Passkey        string
-	LoginURL       string
-	UsersURL       string
 }
 
 func loadConfig() config {
-	base := "https://" + getEnvOrDefault("C411_API_BASE_URL", "c411.org")
+	base := getEnvOrDefault("C411_API_BASE_URL", "c411.org")
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "https://" + base
+	}
+	interval, err := time.ParseDuration(getEnvOrDefault("SCRAPE_INTERVAL", "5m"))
+	if err != nil {
+		log.Printf("[config] invalid SCRAPE_INTERVAL, using 5m: %v", err)
+		interval = 5 * time.Minute
+	}
+	if interval < minScrapeInterval {
+		log.Printf("[config] SCRAPE_INTERVAL %v below %v, raised", interval, minScrapeInterval)
+		interval = minScrapeInterval
+	}
 	return config{
-		BaseURL:        base,
+		BaseURL:        strings.TrimRight(base, "/"),
+		APIKey:         strings.TrimSpace(os.Getenv("C411_API_KEY")),
 		Port:           getEnvOrDefault("PORT", "9090"),
 		MetricsPath:    getEnvOrDefault("METRICS_PATH", "/metrics"),
-		Username:       os.Getenv("C411_USERNAME"),
-		Password:       os.Getenv("C411_PASSWORD"),
-		Passkey:        os.Getenv("C411_PASSKEY"),
-		ScrapeInterval: parseDuration(os.Getenv("SCRAPE_INTERVAL"), 5*time.Minute),
-		// Use web login URL for proper auth flow - visits /login first to get session cookies
-		LoginURL: base + "/login",
-		UsersURL: base + "/api/auth/me",
+		ScrapeInterval: interval,
 	}
 }
 
@@ -60,442 +64,350 @@ func getEnvOrDefault(key, fallback string) string {
 // API client
 // -----------------------------------------------------------------------------
 
-// C411Client manages authentication and communication with the C411 API.
-type C411Client struct {
-	mu          sync.RWMutex
-	cookies     []*http.Cookie
-	csrfToken   string
-	baseURL     string
-	loginURL    string
-	apiLoginURL string
-	usersURL    string
-	httpClient  *http.Client
-	passkey     *passkey
+type transferAmount struct {
+	Actual int64 `json:"actual"`
+	Credit int64 `json:"credit"`
+	Total  int64 `json:"total"`
 }
 
-// c411Jar implements http.CookieJar with per-URL cookie storage
-type c411Jar struct {
-	cookies map[string][]*http.Cookie // keyed by "scheme://host"
+type voie struct {
+	Star            bool `json:"star"`
+	QuestsCompleted int  `json:"questsCompleted"`
+	QuestsTotal     int  `json:"questsTotal"`
 }
 
-// Cookies returns the cookie jar's cookies for the given URL.
-func (j *c411Jar) Cookies(u *url.URL) []*http.Cookie {
-	key := u.Scheme + "://" + u.Host
-	if cookies, ok := j.cookies[key]; ok {
-		return cookies
+// Profile is the response of GET /api/user/profile (scope profile:read).
+type Profile struct {
+	ID          int64  `json:"id"`
+	Username    string `json:"username"`
+	MemberSince string `json:"memberSince"`
+	Level       struct {
+		Level         int   `json:"level"`
+		XP            int64 `json:"xp"`
+		XPIntoLevel   int64 `json:"xpIntoLevel"`
+		XPToNextLevel int64 `json:"xpToNextLevel"`
+	} `json:"level"`
+	Class struct {
+		Slug          string `json:"slug"`
+		EffectiveSlug string `json:"effectiveSlug"`
+		Foundation    string `json:"foundation"`
+		TreeBonusBp   int    `json:"treeBonusBp"`
+		Progress      struct {
+			QuestsCompleted int `json:"questsCompleted"`
+			QuestsTotal     int `json:"questsTotal"`
+			Stars           int `json:"stars"`
+			Grade           struct {
+				Tier  string `json:"tier"`
+				Level int    `json:"level"`
+			} `json:"grade"`
+		} `json:"progress"`
+		Voies map[string]voie `json:"voies"`
+	} `json:"class"`
+	Team *struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+		Tag  string `json:"tag"`
+		Role string `json:"role"`
+	} `json:"team"`
+	Zen struct {
+		Balance     int64 `json:"balance"`
+		TotalEarned int64 `json:"totalEarned"`
+		TotalSpent  int64 `json:"totalSpent"`
+	} `json:"zen"`
+	Transfer struct {
+		Uploaded   transferAmount `json:"uploaded"`
+		Downloaded transferAmount `json:"downloaded"`
+	} `json:"transfer"`
+	Download struct {
+		Allowed       bool    `json:"allowed"`
+		BlockedReason *string `json:"blockedReason"`
+	} `json:"download"`
+	Freeleech struct {
+		Active  bool     `json:"active"`
+		Sources []string `json:"sources"`
+	} `json:"freeleech"`
+	SilverLeech  bool              `json:"silverLeech"`
+	LeechBonuses []json.RawMessage `json:"leechBonuses"`
+}
+
+type apiClient struct {
+	profileURL string
+	apiKey     string
+	http       *http.Client
+}
+
+func newAPIClient(baseURL, apiKey string) *apiClient {
+	return &apiClient{
+		profileURL: baseURL + "/api/user/profile",
+		apiKey:     apiKey,
+		http:       &http.Client{Timeout: 20 * time.Second},
 	}
-	return nil
 }
 
-// SetCookies stores cookies for the given URL.
-func (j *c411Jar) SetCookies(u *url.URL, cookies []*http.Cookie) {
-	key := u.Scheme + "://" + u.Host
-	if j.cookies == nil {
-		j.cookies = make(map[string][]*http.Cookie)
-	}
-	// Merge or replace cookies for this URL
-	j.cookies[key] = append(j.cookies[key], cookies...)
-}
-
-func newC411Client(baseURL, loginURL, usersURL string) *C411Client {
-	jar := &c411Jar{cookies: make(map[string][]*http.Cookie)}
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Jar:     jar,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
-
-	return &C411Client{
-		baseURL:     baseURL,
-		loginURL:    loginURL,
-		apiLoginURL: baseURL + "/api/auth/login",
-		usersURL:    usersURL,
-		httpClient:  client,
-	}
-}
-
-// FirstRequest fetches the CSRF token from the login page.
-func (c *C411Client) FirstRequest() error {
-	fmt.Printf("[auth] Fetching login page: %s\n", c.loginURL)
-
-	req, err := http.NewRequest(http.MethodGet, c.loginURL, nil)
+func (c *apiClient) FetchProfile() (*Profile, error) {
+	req, err := http.NewRequest(http.MethodGet, c.profileURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to build first request: %w", err)
+		return nil, err
 	}
-
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Referer", c.baseURL)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("first request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	html := string(body)
-	fmt.Printf("[auth] Response status: %s\n", resp.Status)
-
-	// Extract CSRF token from <meta name="csrf-token" content="...">
-	re := regexp.MustCompile(`(?i)<meta[^>]*name=["']csrf-token["'][^>]*content=["']([^"']+)["']`)
-	matches := re.FindStringSubmatch(html)
-	if len(matches) >= 2 {
-		c.mu.Lock()
-		c.cookies = resp.Cookies()
-		c.csrfToken = matches[1]
-		c.mu.Unlock()
-
-		fmt.Println("[auth] CSRF token extracted")
-		return nil
-	}
-
-	return fmt.Errorf("failed to extract CSRF token from login page")
-}
-
-func (c *C411Client) IsAuthenticated() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.cookies) > 0
-}
-
-// Login authenticates with the C411 API and stores the returned session cookies.
-func (c *C411Client) Login(username, password string) error {
-	// Password login now requires a Cloudflare Turnstile token; prefer the passkey.
-	if c.passkey != nil {
-		return c.PasskeyLogin()
-	}
-	if err := c.FirstRequest(); err != nil {
-		return fmt.Errorf("first request failed: %w", err)
-	}
-
-	// Build JSON body (matching the real JS client)
-	payload, err := json.Marshal(map[string]string{
-		"username": username,
-		"password": password,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to encode login payload: %w", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, c.apiLoginURL, strings.NewReader(string(payload)))
-	if err != nil {
-		return fmt.Errorf("failed to build login request: %w", err)
-	}
-
-	// Attach cookies from FirstRequest (includes __csrf)
-	c.mu.RLock()
-	for _, cookie := range c.cookies {
-		req.AddCookie(cookie)
-	}
-	c.mu.RUnlock()
-
-	// Headers matching the real JS client
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Origin", c.baseURL)
-	req.Header.Set("Referer", c.loginURL)
-	req.Header.Set("csrf-token", c.csrfToken)
+	req.Header.Set("User-Agent", "c411-exporter/2")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("login request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("[auth] Login failed: %s\n%s\n", resp.Status, string(respBody))
-		return fmt.Errorf("login failed: %s", resp.Status)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	// Merge login response cookies (session) with existing cookies (__csrf)
-	c.mu.Lock()
-	c.cookies = append(c.cookies, resp.Cookies()...)
-	c.mu.Unlock()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized:
+		return nil, errors.New("401: API key missing or invalid")
+	case http.StatusForbidden:
+		return nil, errors.New("403: API key lacks the profile:read scope (create a new key with it)")
+	case http.StatusTooManyRequests:
+		return nil, errors.New("429: rate limit reached, raise SCRAPE_INTERVAL")
+	default:
+		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, truncate(body))
+	}
 
-	fmt.Printf("[auth] Authenticated as %s\n", username)
-	return nil
+	var p Profile
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("parse profile: %w", err)
+	}
+	return &p, nil
 }
 
-// FetchMetrics retrieves the current user's metrics from the C411 API.
-func (c *C411Client) FetchMetrics() (*UserMetrics, error) {
-	c.mu.RLock()
-	cookies := c.cookies
-	c.mu.RUnlock()
-
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("not authenticated")
+func truncate(b []byte) string {
+	if len(b) > 200 {
+		return string(b[:200]) + "..."
 	}
-
-	req, err := http.NewRequest(http.MethodGet, c.usersURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build metrics request: %w", err)
-	}
-
-	// Attach stored cookies to the request
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("metrics request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("authentication required")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected metrics response: %s", resp.Status)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read metrics response: %w", err)
-	}
-
-	var wrapper userWrapper
-	if err := json.Unmarshal(body, &wrapper); err != nil {
-		return nil, fmt.Errorf("failed to parse metrics response: %w", err)
-	}
-
-	return &UserMetrics{
-		TotalUploadedBytes:   wrapper.User.Uploaded,
-		TotalDownloadedBytes: wrapper.User.Downloaded,
-		Username:             wrapper.User.Username,
-	}, nil
-}
-
-// -----------------------------------------------------------------------------
-// Domain types
-// -----------------------------------------------------------------------------
-
-type userWrapper struct {
-	User struct {
-		Uploaded   int64  `json:"uploaded"`
-		Downloaded int64  `json:"downloaded"`
-		Username   string `json:"username"`
-	} `json:"user"`
-}
-
-type UserMetrics struct {
-	TotalUploadedBytes   int64
-	TotalDownloadedBytes int64
-	Username             string
+	return string(b)
 }
 
 // -----------------------------------------------------------------------------
 // Prometheus metrics
 // -----------------------------------------------------------------------------
 
+const ns = "c411"
+
 type exporterMetrics struct {
+	// v1 names kept for dashboard compatibility (= transfer.*.total)
 	totalUploaded   prometheus.Gauge
 	totalDownloaded prometheus.Gauge
+
+	uploaded       *prometheus.GaugeVec
+	downloaded     *prometheus.GaugeVec
+	ratio          prometheus.Gauge
+	level          prometheus.Gauge
+	xp             prometheus.Gauge
+	xpIntoLevel    prometheus.Gauge
+	xpToNextLevel  prometheus.Gauge
+	zenBalance     prometheus.Gauge
+	zenEarned      prometheus.Gauge
+	zenSpent       prometheus.Gauge
+	quests         *prometheus.GaugeVec
+	stars          prometheus.Gauge
+	gradeLevel     prometheus.Gauge
+	treeBonusBp    prometheus.Gauge
+	voieQuests     *prometheus.GaugeVec
+	voieStar       *prometheus.GaugeVec
+	downloadAllow  prometheus.Gauge
+	freeleech      prometheus.Gauge
+	silverLeech    prometheus.Gauge
+	leechBonuses   prometheus.Gauge
+	userInfo       *prometheus.GaugeVec
+	up             prometheus.Gauge
+	lastSuccess    prometheus.Gauge
+	scrapeFailures prometheus.Counter
+}
+
+func gauge(name, help string) prometheus.Gauge {
+	return prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: name, Help: help})
+}
+
+func gaugeVec(name, help string, labels ...string) *prometheus.GaugeVec {
+	return prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: ns, Name: name, Help: help}, labels)
 }
 
 func newExporterMetrics(reg prometheus.Registerer) *exporterMetrics {
 	m := &exporterMetrics{
-		totalUploaded: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "c411",
-			Name:      "total_uploaded_bytes",
-			Help:      "Total uploaded bytes from C411 API",
-		}),
-		totalDownloaded: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: "c411",
-			Name:      "total_downloaded_bytes",
-			Help:      "Total downloaded bytes from C411 API",
+		totalUploaded:   gauge("total_uploaded_bytes", "Total uploaded bytes, real + credit (same as c411_uploaded_bytes{kind=\"total\"})."),
+		totalDownloaded: gauge("total_downloaded_bytes", "Total downloaded bytes, real + credit (same as c411_downloaded_bytes{kind=\"total\"})."),
+		uploaded:        gaugeVec("uploaded_bytes", "Uploaded bytes by kind (actual, credit, total).", "kind"),
+		downloaded:      gaugeVec("downloaded_bytes", "Downloaded bytes by kind (actual, credit, total).", "kind"),
+		ratio:           gauge("ratio", "Total uploaded / total downloaded (0 when nothing downloaded)."),
+		level:           gauge("level", "User level."),
+		xp:              gauge("xp", "Total XP."),
+		xpIntoLevel:     gauge("xp_into_level", "XP earned in the current level."),
+		xpToNextLevel:   gauge("xp_to_next_level", "XP still needed for the next level."),
+		zenBalance:      gauge("zen_balance", "Current zen balance."),
+		zenEarned:       gauge("zen_earned_total", "Zen earned since account creation."),
+		zenSpent:        gauge("zen_spent_total", "Zen spent since account creation."),
+		quests:          gaugeVec("class_quests", "Class quests, state=completed|total.", "state"),
+		stars:           gauge("class_stars", "Class stars."),
+		gradeLevel:      gauge("class_grade_level", "Level inside the current grade tier."),
+		treeBonusBp:     gauge("class_tree_bonus_basis_points", "Class tree bonus in basis points."),
+		voieQuests:      gaugeVec("voie_quests", "Quests per voie, state=completed|total.", "voie", "state"),
+		voieStar:        gaugeVec("voie_star", "1 if the voie star is earned.", "voie"),
+		downloadAllow:   gauge("download_allowed", "1 if downloading is allowed."),
+		freeleech:       gauge("freeleech_active", "1 if freeleech is active."),
+		silverLeech:     gauge("silverleech_active", "1 if silverleech is active."),
+		leechBonuses:    gauge("leech_bonuses", "Number of active leech bonuses."),
+		userInfo:        gaugeVec("user_info", "User info, value is always 1.", "username", "class", "grade_tier", "team"),
+		up:              gauge("up", "1 if the last API call succeeded."),
+		lastSuccess:     gauge("last_success_timestamp_seconds", "Unix time of the last successful API call."),
+		scrapeFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "scrape_failures_total", Help: "Failed API calls.",
 		}),
 	}
-	reg.MustRegister(m.totalUploaded, m.totalDownloaded)
+	reg.MustRegister(
+		m.totalUploaded, m.totalDownloaded, m.uploaded, m.downloaded, m.ratio,
+		m.level, m.xp, m.xpIntoLevel, m.xpToNextLevel,
+		m.zenBalance, m.zenEarned, m.zenSpent,
+		m.quests, m.stars, m.gradeLevel, m.treeBonusBp, m.voieQuests, m.voieStar,
+		m.downloadAllow, m.freeleech, m.silverLeech, m.leechBonuses,
+		m.userInfo, m.up, m.lastSuccess, m.scrapeFailures,
+	)
 	return m
 }
 
-func (m *exporterMetrics) update(u *UserMetrics) {
-	m.totalUploaded.Set(float64(u.TotalUploadedBytes))
-	m.totalDownloaded.Set(float64(u.TotalDownloadedBytes))
+func b2f(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func setTransfer(v *prometheus.GaugeVec, t transferAmount) {
+	v.WithLabelValues("actual").Set(float64(t.Actual))
+	v.WithLabelValues("credit").Set(float64(t.Credit))
+	v.WithLabelValues("total").Set(float64(t.Total))
+}
+
+func (m *exporterMetrics) update(p *Profile) {
+	up, down := p.Transfer.Uploaded, p.Transfer.Downloaded
+	m.totalUploaded.Set(float64(up.Total))
+	m.totalDownloaded.Set(float64(down.Total))
+	setTransfer(m.uploaded, up)
+	setTransfer(m.downloaded, down)
+	if down.Total > 0 {
+		m.ratio.Set(float64(up.Total) / float64(down.Total))
+	} else {
+		m.ratio.Set(0)
+	}
+
+	m.level.Set(float64(p.Level.Level))
+	m.xp.Set(float64(p.Level.XP))
+	m.xpIntoLevel.Set(float64(p.Level.XPIntoLevel))
+	m.xpToNextLevel.Set(float64(p.Level.XPToNextLevel))
+
+	m.zenBalance.Set(float64(p.Zen.Balance))
+	m.zenEarned.Set(float64(p.Zen.TotalEarned))
+	m.zenSpent.Set(float64(p.Zen.TotalSpent))
+
+	prog := p.Class.Progress
+	m.quests.WithLabelValues("completed").Set(float64(prog.QuestsCompleted))
+	m.quests.WithLabelValues("total").Set(float64(prog.QuestsTotal))
+	m.stars.Set(float64(prog.Stars))
+	m.gradeLevel.Set(float64(prog.Grade.Level))
+	m.treeBonusBp.Set(float64(p.Class.TreeBonusBp))
+	m.voieQuests.Reset()
+	m.voieStar.Reset()
+	for name, v := range p.Class.Voies {
+		m.voieQuests.WithLabelValues(name, "completed").Set(float64(v.QuestsCompleted))
+		m.voieQuests.WithLabelValues(name, "total").Set(float64(v.QuestsTotal))
+		m.voieStar.WithLabelValues(name).Set(b2f(v.Star))
+	}
+
+	m.downloadAllow.Set(b2f(p.Download.Allowed))
+	m.freeleech.Set(b2f(p.Freeleech.Active))
+	m.silverLeech.Set(b2f(p.SilverLeech))
+	m.leechBonuses.Set(float64(len(p.LeechBonuses)))
+
+	team := ""
+	if p.Team != nil {
+		team = p.Team.Name
+	}
+	m.userInfo.Reset() // labels can change (class, grade, team)
+	m.userInfo.WithLabelValues(p.Username, p.Class.EffectiveSlug, prog.Grade.Tier, team).Set(1)
+
+	m.up.Set(1)
+	m.lastSuccess.Set(float64(time.Now().Unix()))
 }
 
 // -----------------------------------------------------------------------------
-// HTTP handlers
+// Server
 // -----------------------------------------------------------------------------
 
 type server struct {
+	client  *apiClient
+	metrics *exporterMetrics
+
 	mu          sync.RWMutex
-	client      *C411Client
-	metrics     *exporterMetrics
-	lastMetrics *UserMetrics
-	username    string
-	password    string
+	lastSuccess time.Time
+	lastError   string
 }
 
-func (s *server) metricsHandler(c *gin.Context) {
-	c.Header("Content-Type", "text/plain; version=0.0.4")
-	promhttp.Handler().ServeHTTP(c.Writer, c.Request)
-}
-
-// scrapeAndRefresh fetches metrics from C411 and updates the Prometheus gauges.
-// If the fetch fails it attempts to reconnect and retry once before giving up.
-func (s *server) scrapeAndRefresh() {
-	// --- first attempt ---------------------------------------------------
-	if !s.client.IsAuthenticated() {
-		fmt.Println("[scraper] Not authenticated, attempting reconnect...")
-	} else {
-		userMetrics, err := s.client.FetchMetrics()
-		if err == nil {
-			s.applyMetrics(userMetrics)
-			return
-		}
-		fmt.Printf("[scraper] Fetch failed: %v, attempting reconnect...\n", err)
-	}
-
-	// --- reconnect and retry once ----------------------------------------
-	if err := s.reconnect(); err != nil {
-		fmt.Printf("[scraper] Reconnect failed: %v\n", err)
-		return
-	}
-
-	userMetrics, err := s.client.FetchMetrics()
-	if err != nil {
-		fmt.Printf("[scraper] Fetch still failing after reconnect: %v\n", err)
-		return
-	}
-
-	s.applyMetrics(userMetrics)
-}
-
-// reconnect re-authenticates using the stored credentials.
-func (s *server) reconnect() error {
-	if s.client.passkey == nil && (s.username == "" || s.password == "") {
-		return fmt.Errorf("cannot reconnect: no credentials configured")
-	}
-	fmt.Println("[scraper] Reconnecting...")
-	return s.client.Login(s.username, s.password)
-}
-
-// applyMetrics updates the Prometheus gauges and stores the latest snapshot.
-func (s *server) applyMetrics(userMetrics *UserMetrics) {
-	s.metrics.update(userMetrics)
+// scrape calls the API once and updates the gauges. On failure the previous
+// values are kept and c411_up drops to 0.
+func (s *server) scrape() {
+	p, err := s.client.FetchProfile()
 	s.mu.Lock()
-	s.lastMetrics = userMetrics
-	s.mu.Unlock()
-
-	fmt.Printf("[scraper] Updated metrics: %s (↑%d ↓%d)\n",
-		userMetrics.Username, userMetrics.TotalUploadedBytes, userMetrics.TotalDownloadedBytes)
+	defer s.mu.Unlock()
+	if err != nil {
+		s.lastError = err.Error()
+		s.metrics.up.Set(0)
+		s.metrics.scrapeFailures.Inc()
+		log.Printf("[scraper] fetch failed: %v", err)
+		return
+	}
+	s.metrics.update(p)
+	s.lastSuccess = time.Now()
+	s.lastError = ""
+	log.Printf("[scraper] updated %s (up %d, down %d, level %d)",
+		p.Username, p.Transfer.Uploaded.Total, p.Transfer.Downloaded.Total, p.Level.Level)
 }
 
-// startMetricsRefresher launches a background goroutine that periodically
-// scrapes C411 data and updates the Prometheus gauges.
-func (s *server) startMetricsRefresher(interval time.Duration) {
-	// Perform an initial scrape immediately
-	go s.scrapeAndRefresh()
-
-	ticker := time.NewTicker(interval)
-	go func() {
-		for range ticker.C {
-			s.scrapeAndRefresh()
-		}
-	}()
+func (s *server) run(interval time.Duration) {
+	s.scrape()
+	for range time.Tick(interval) {
+		s.scrape()
+	}
 }
 
-func (s *server) healthHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status":        "healthy",
-		"authenticated": s.client.IsAuthenticated(),
-	})
+func (s *server) healthHandler(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	resp := map[string]any{"status": "healthy", "last_error": s.lastError}
+	if !s.lastSuccess.IsZero() {
+		resp["last_success"] = s.lastSuccess.UTC().Format(time.RFC3339)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
-
-// -----------------------------------------------------------------------------
-// Entrypoint
-// -----------------------------------------------------------------------------
 
 func main() {
 	cfg := loadConfig()
-
-	client := newC411Client(cfg.BaseURL, cfg.LoginURL, cfg.UsersURL)
-	metrics := newExporterMetrics(prometheus.DefaultRegisterer)
-	srv := &server{client: client, metrics: metrics, username: cfg.Username, password: cfg.Password}
-
-	if cfg.Passkey != "" {
-		pk, err := parsePasskey(cfg.Passkey)
-		if err != nil {
-			fmt.Printf("[auth] Invalid C411_PASSKEY: %v\n", err)
-			os.Exit(1)
-		}
-		client.passkey = pk
-		fmt.Println("[auth] Passkey loaded, attempting passkey login...")
-		if err := client.Login("", ""); err != nil {
-			fmt.Printf("[auth] Auto-login failed (non-fatal): %v\n", err)
-		}
-	} else if cfg.Username != "" && cfg.Password != "" {
-		fmt.Println("[auth] Credentials found, attempting auto-login...")
-		if err := client.Login(cfg.Username, cfg.Password); err != nil {
-			fmt.Printf("[auth] Auto-login failed (non-fatal): %v\n", err)
-		}
-	} else {
-		fmt.Println("[auth] No credentials provided, auto-login skipped")
+	if cfg.APIKey == "" {
+		log.Fatal("[config] C411_API_KEY is required (create a key with the profile:read scope)")
 	}
 
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
+	srv := &server{
+		client:  newAPIClient(cfg.BaseURL, cfg.APIKey),
+		metrics: newExporterMetrics(prometheus.DefaultRegisterer),
+	}
+	go srv.run(cfg.ScrapeInterval)
 
-	r.GET(cfg.MetricsPath, srv.metricsHandler)
-	r.GET("/health", srv.healthHandler)
-
-	// Start background metrics refresher
-	srv.startMetricsRefresher(cfg.ScrapeInterval)
-	fmt.Printf("[server] Metrics refresh interval: %v\n", cfg.ScrapeInterval)
+	mux := http.NewServeMux()
+	mux.Handle(cfg.MetricsPath, promhttp.Handler())
+	mux.HandleFunc("/health", srv.healthHandler)
 
 	addr := ":" + cfg.Port
-	fmt.Printf("[server] Starting C411 exporter on %s\n", addr)
-	fmt.Printf("[server] Metrics available at: http://localhost%s%s\n", addr, cfg.MetricsPath)
-
-	if err := r.Run(addr); err != nil {
-		fmt.Printf("[server] Error starting server: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-
-// parseDuration parses a simple duration string (e.g. "30s", "5m", "2h").
-// Returns fallback if the string is empty or cannot be parsed.
-func parseDuration(s string, fallback time.Duration) time.Duration {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return fallback
-	}
-	units := []struct {
-		suffix string
-		mult   time.Duration
-	}{
-		{"h", time.Hour},
-		{"m", time.Minute},
-		{"s", time.Second},
-	}
-	for _, u := range units {
-		if strings.HasSuffix(s, u.suffix) {
-			numStr := strings.TrimSuffix(s, u.suffix)
-			var n int
-			if _, err := fmt.Sscanf(numStr, "%d", &n); err == nil && n > 0 {
-				return time.Duration(n) * u.mult
-			}
-		}
-	}
-	return fallback
+	log.Printf("[server] c411 exporter v2 on %s%s, refresh every %v", addr, cfg.MetricsPath, cfg.ScrapeInterval)
+	log.Fatal(http.ListenAndServe(addr, mux))
 }

@@ -1,31 +1,40 @@
 # c411_exporter
 
-Prometheus exporter for C411: exposes uploaded/downloaded bytes of your account.
-
-## Metrics
-
-- `c411_total_uploaded_bytes`
-- `c411_total_downloaded_bytes`
+Prometheus exporter for C411: exposes your account stats (transfer, ratio, level, zen, class quests...)
+from the official API `GET /api/user/profile`.
 
 ## Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `C411_PASSKEY` | Passkey JSON exported from Bitwarden/Vaultwarden (**recommended**) | |
-| `C411_USERNAME` / `C411_PASSWORD` | Password login, only works if Cloudflare Turnstile is off | |
+| `C411_API_KEY` | API key with the **`profile:read`** scope (required) | |
 | `C411_API_BASE_URL` | Site host | `c411.org` |
 | `PORT` | Listen port | `9090` |
-| `SCRAPE_INTERVAL` | Refresh rate | `5m` |
+| `METRICS_PATH` | Metrics path | `/metrics` |
+| `SCRAPE_INTERVAL` | Refresh rate (Go duration, min `30s`) | `5m` |
 
-C411 login now requires a Cloudflare Turnstile token, so the exporter signs in with a passkey.
-Get it with the Bitwarden CLI (works with Vaultwarden):
+Create the key on c411 and tick the `profile:read` scope: it is not granted by default and the
+scope of an existing key cannot be changed. Use a dedicated key for the exporter: the endpoint
+allows 30 req/min per key, shared with the 120 req/min Torznab budget of the same key.
+Data is refreshed at most every 30 s, so polling faster is useless.
 
-```bash
-bw get item <id> | jq -c '.login.fido2Credentials[0] | {credentialId, keyValue, rpId, userHandle, counter}' \
-  | sed 's/^/C411_PASSKEY=/' >> .env
-```
+## Metrics
 
-Use a dedicated passkey for the exporter: it is a full login secret.
+| Metric | Description |
+|--------|-------------|
+| `c411_uploaded_bytes{kind="actual\|credit\|total"}` | Uploaded bytes |
+| `c411_downloaded_bytes{kind="actual\|credit\|total"}` | Downloaded bytes |
+| `c411_total_uploaded_bytes`, `c411_total_downloaded_bytes` | v1 names, = `kind="total"` |
+| `c411_ratio` | total uploaded / total downloaded |
+| `c411_level`, `c411_xp`, `c411_xp_into_level`, `c411_xp_to_next_level` | Level and XP |
+| `c411_zen_balance`, `c411_zen_earned_total`, `c411_zen_spent_total` | Zen |
+| `c411_class_quests{state="completed\|total"}`, `c411_class_stars`, `c411_class_grade_level`, `c411_class_tree_bonus_basis_points` | Class progress |
+| `c411_voie_quests{voie,state}`, `c411_voie_star{voie}` | Per-voie progress |
+| `c411_download_allowed`, `c411_freeleech_active`, `c411_silverleech_active`, `c411_leech_bonuses` | Download state |
+| `c411_user_info{username,class,grade_tier,team}` | Always 1 |
+| `c411_up`, `c411_last_success_timestamp_seconds`, `c411_scrape_failures_total` | Exporter health |
+
+On an API error the last values are kept and `c411_up` drops to 0.
 
 ## Run
 
@@ -37,20 +46,13 @@ docker compose up -d
 docker compose -f docker-compose.dev.yml up --build
 
 # Local
-go build -o c411_exporter . && ./c411_exporter
+go build -o c411_exporter . && C411_API_KEY=... ./c411_exporter
 ```
 
 ## Endpoints
 
 - `GET /metrics` - Prometheus metrics
-- `GET /health` - Health check
-
-```text
-# TYPE c411_total_uploaded_bytes gauge
-c411_total_uploaded_bytes 5.58255848392e+11
-# TYPE c411_total_downloaded_bytes gauge
-c411_total_downloaded_bytes 1.073741824e+09
-```
+- `GET /health` - JSON with last success time and last error
 
 ## Prometheus Configuration
 
@@ -59,16 +61,9 @@ scrape_configs:
   - job_name: 'c411_exporter'
     static_configs:
       - targets: ['localhost:9090']
-    metrics_path: /metrics
 ```
 
-## Authentication Flow
-
-1. With `C411_PASSKEY`: `GET /login` (CSRF), `POST /api/auth/passkey-login-options` for the challenge, sign it locally (ES256), `POST /api/auth/passkey-login`
-2. Without it: `POST /api/auth/login` with username/password (fails with `400 TURNSTILE_REQUIRED` while Turnstile is on)
-3. Keep the session cookies; on expiry the exporter logs in again with the same method
-
-See [CHANGELOG.md](./CHANGELOG.md) for the passkey migration.
+See [CHANGELOG.md](./CHANGELOG.md) for the v1 to v2 migration.
 
 ## License
 

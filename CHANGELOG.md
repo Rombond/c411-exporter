@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.0.0 - 2026-11-22
+
+### Breaking
+- Uses the official C411 API (`GET /api/user/profile`) with `C411_API_KEY` (Bearer, scope `profile:read`).
+- Removed `C411_USERNAME`, `C411_PASSWORD`, `C411_PASSKEY`, the CSRF/cookie login and the passkey signer.
+- `SCRAPE_INTERVAL` is now a Go duration (`90s`, `5m`, `1h30m`) with a 30 s minimum.
+
+### Added
+- Metrics: upload/download by kind (actual/credit/total), ratio, level/XP, zen, class quests, stars,
+  grade, per-voie progress, download/freeleech/silverleech state, `c411_user_info`.
+- Exporter health: `c411_up`, `c411_last_success_timestamp_seconds`, `c411_scrape_failures_total`.
+
+### Changed
+- `c411_total_uploaded_bytes` / `c411_total_downloaded_bytes` kept, now from `transfer.*.total`.
+- Gin dropped for the standard library HTTP server. Dockerfile cleaned (port 9090, no config flag).
+- `/health` reports last success time and last error instead of `authenticated`.
+
+### Upgrade
+1. On c411, create an API key with the `profile:read` scope (not ticked by default).
+2. Set `C411_API_KEY` in `.env`, remove `C411_USERNAME` / `C411_PASSWORD` / `C411_PASSKEY`.
+3. Pull the image and restart. You can delete the exporter's dedicated passkey on c411.
+
 ## v1.1.0 - 2026-10-06
 
 ### Added
